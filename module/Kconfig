@@ -1,0 +1,19 @@
+config PARASYTE
+	bool "Enable parasyte"
+	default n
+	depends on ARM64 && SMP && HOTPLUG_CPU && OF_RESERVED_MEM
+	select CMA
+
+choice
+	prompt "Select parasyte role"
+  default PARASYTE_HIVE
+
+config PARASYTE_HIVE
+	bool "Enable parasyte hive"
+	select PARASYTE
+
+config PARASYTE_SPORE
+	bool "Enable parasyte spore"
+	select PARASYTE
+
+endchoice

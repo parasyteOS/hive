@@ -1,0 +1,3 @@
+- `.h.patch` files are required by host kernel
+- `.g.patch` files are required by guest kernel
+- `.hg.patch` files are required by both kernel
