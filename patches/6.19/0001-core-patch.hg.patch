@@ -1,0 +1,210 @@
+From fc4a1a396d8f7e0e6d1e26c6efae567026795180 Mon Sep 17 00:00:00 2001
+From: mlatus <wqseleven@gmail.com>
+Date: Wed, 11 Mar 2026 21:57:17 +0800
+Subject: [PATCH 1/2] core patch
+
+---
+ arch/arm64/Kbuild                      |  1 +
+ arch/arm64/Kconfig                     |  2 +
+ arch/arm64/include/asm/smp.h           | 12 ++++
+ arch/arm64/kernel/smp.c                | 49 +++++++++++++
+ arch/arm64/mm/init.c                   |  6 ++
+ kernel/reboot.c                        |  7 ++
+ 8 files changed, 207 insertions(+)
+
+diff --git a/arch/arm64/Kbuild b/arch/arm64/Kbuild
+index d876bc0e5..ff91a4d19 100644
+--- a/arch/arm64/Kbuild
++++ b/arch/arm64/Kbuild
+@@ -8,6 +8,7 @@ obj-$(CONFIG_KVM)	+= kvm/
+ obj-$(CONFIG_XEN)	+= xen/
+ obj-$(subst m,y,$(CONFIG_HYPERV))	+= hyperv/
+ obj-$(CONFIG_CRYPTO)	+= crypto/
++obj-$(CONFIG_PARASYTE) += parasyte/
+ 
+ # for cleaning
+ subdir- += boot
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 93173f0a0..936e79237 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -2489,3 +2489,5 @@ source "drivers/acpi/Kconfig"
+ source "arch/arm64/kvm/Kconfig"
+ 
+ source "kernel/livepatch/Kconfig"
++
++source "arch/arm64/parasyte/Kconfig"
+diff --git a/arch/arm64/include/asm/smp.h b/arch/arm64/include/asm/smp.h
+index 10ea4f543..35e6e1730 100644
+--- a/arch/arm64/include/asm/smp.h
++++ b/arch/arm64/include/asm/smp.h
+@@ -57,6 +57,10 @@ enum ipi_msg_type {
+ 	IPI_CPU_STOP_NMI,
+ 	IPI_TIMER,
+ 	IPI_IRQ_WORK,
++#ifdef CONFIG_PARASYTE
++	IPI_PARASYTE,
++	IPI_PARASYTE_SHUTDOWN,
++#endif
+ 	NR_IPI,
+ 	/*
+ 	 * Any enum >= NR_IPI and < MAX_IPI is special and not tracable
+@@ -98,6 +102,14 @@ extern void secondary_entry(void);
+ 
+ extern void arch_send_call_function_single_ipi(int cpu);
+ extern void arch_send_call_function_ipi_mask(const struct cpumask *mask);
++#ifdef CONFIG_PARASYTE_HIVE
++extern void parasyte_notify_mask(const struct cpumask *target);
++extern void parasyte_request_shutdown_mask(const struct cpumask *target);
++#endif
++#ifdef CONFIG_PARASYTE_SPORE
++extern void parasyte_notify_hive(void);
++extern void parasyte_report_shutdown(void);
++#endif
+ 
+ #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
+ extern void arch_send_wakeup_ipi(unsigned int cpu);
+diff --git a/arch/arm64/kernel/smp.c b/arch/arm64/kernel/smp.c
+index 1aa324104..73107df41 100644
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@ -52,6 +52,9 @@
+ #include <asm/tlbflush.h>
+ #include <asm/ptrace.h>
+ #include <asm/virt.h>
++#ifdef CONFIG_PARASYTE
++#include <asm/parasyte.h>
++#endif
+ 
+ #include <trace/events/ipi.h>
+ 
+@@ -724,6 +727,9 @@ static void __init of_parse_and_init_cpus(void)
+ 
+ 		pr_debug("cpu logical map 0x%llx\n", hwid);
+ 		set_cpu_logical_map(cpu_count, hwid);
++#ifdef PARASYTE_SPORE
++		parasyte_spore_set_cpu_mapping(cpu_count, dn);
++#endif
+ 
+ 		early_map_cpu_to_node(cpu_count, of_node_to_nid(dn));
+ next:
+@@ -820,6 +826,10 @@ static const char *ipi_types[MAX_IPI] __tracepoint_string = {
+ 	[IPI_CPU_STOP_NMI]	= "CPU stop NMIs",
+ 	[IPI_TIMER]		= "Timer broadcast interrupts",
+ 	[IPI_IRQ_WORK]		= "IRQ work interrupts",
++#ifdef CONFIG_PARASYTE
++	[IPI_PARASYTE]		= "Parasyte communitcation interrupts",
++	[IPI_PARASYTE_SHUTDOWN]	= "Parasyte machine control interrupts",
++#endif
+ 	[IPI_CPU_BACKTRACE]	= "CPU backtrace interrupts",
+ 	[IPI_KGDB_ROUNDUP]	= "KGDB roundup interrupts",
+ };
+@@ -1005,6 +1015,21 @@ static void do_handle_IPI(int ipinr)
+ 		kgdb_nmicallback(cpu, get_irq_regs());
+ 		break;
+ 
++#ifdef CONFIG_PARASYTE
++	case IPI_PARASYTE:
++		if (parasyte_ready())
++			parasyte_handle_irq();
++		break;
++	case IPI_PARASYTE_SHUTDOWN:
++#ifdef CONFIG_PARASYTE_SPORE
++		parasyte_spore_shutdown();
++#endif
++#ifdef CONFIG_PARASYTE_HIVE
++		parasyte_post_spore_shutdown();
++#endif
++		break;
++#endif
++
+ 	default:
+ 		pr_crit("CPU%u: Unknown IPI message 0x%x\n", cpu, ipinr);
+ 		break;
+@@ -1309,3 +1334,27 @@ bool cpus_are_stuck_in_kernel(void)
+ 	return !!cpus_stuck_in_kernel || smp_spin_tables ||
+ 		is_protected_kvm_enabled();
+ }
++
++#ifdef CONFIG_PARASYTE_HIVE
++void parasyte_notify_mask(const struct cpumask *target)
++{
++	smp_cross_call(target, IPI_PARASYTE);
++}
++
++void parasyte_request_shutdown_mask(const struct cpumask *target)
++{
++	smp_cross_call(target, IPI_PARASYTE_SHUTDOWN);
++}
++#endif
++
++#ifdef CONFIG_PARASYTE_SPORE
++void parasyte_notify_hive(void)
++{
++	__parasyte_notify_hive(IPI_PARASYTE);
++}
++
++void parasyte_report_shutdown(void)
++{
++	__parasyte_notify_hive(IPI_PARASYTE_SHUTDOWN);
++}
++#endif
+diff --git a/arch/arm64/mm/init.c b/arch/arm64/mm/init.c
+index 524d34a0e..7c4c4db63 100644
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@ -48,6 +48,9 @@
+ #include <asm/tlb.h>
+ #include <asm/alternative.h>
+ #include <asm/xen/swiotlb-xen.h>
++#ifdef CONFIG_PARASYTE_HIVE
++#include <asm/parasyte.h>
++#endif
+ 
+ /*
+  * We need to be able to catch inadvertent references to memstart_addr
+@@ -325,6 +328,9 @@ void __init bootmem_init(void)
+ 	 * Reserve the CMA area after arm64_dma_phys_limit was initialised.
+ 	 */
+ 	dma_contiguous_reserve(arm64_dma_phys_limit);
++#ifdef CONFIG_PARASYTE_HIVE
++	parasyte_reserve_cma();
++#endif
+ 
+ 	/*
+ 	 * request_standard_resources() depends on crashkernel's memory being
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+index ec087827c..798b63927 100644
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -18,6 +18,9 @@
+ #include <linux/syscalls.h>
+ #include <linux/syscore_ops.h>
+ #include <linux/uaccess.h>
++#ifdef CONFIG_PARASYTE_SPORE
++#include <asm/parasyte.h>
++#endif
+ 
+ /*
+  * this indicates whether you can reboot with ctrl-alt-del: the default is yes
+@@ -704,6 +707,9 @@ EXPORT_SYMBOL_GPL(kernel_can_power_off);
+  */
+ void kernel_power_off(void)
+ {
++#ifdef CONFIG_PARASYTE_SPORE
++	parasyte_spore_shutdown();
++#else
+ 	kernel_shutdown_prepare(SYSTEM_POWER_OFF);
+ 	do_kernel_power_off_prepare();
+ 	migrate_to_reboot_cpu();
+@@ -712,6 +718,7 @@ void kernel_power_off(void)
+ 	pr_flush(1000, true);
+ 	kmsg_dump(KMSG_DUMP_SHUTDOWN);
+ 	machine_power_off();
++#endif
+ }
+ EXPORT_SYMBOL_GPL(kernel_power_off);
+ 
+-- 
+2.51.2
+

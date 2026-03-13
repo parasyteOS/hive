@@ -1,0 +1,303 @@
+From ca2348a62f200502ab68bb54e63c67f4d473b38c Mon Sep 17 00:00:00 2001
+From: mlatus <wqseleven@gmail.com>
+Date: Wed, 11 Mar 2026 22:03:20 +0800
+Subject: [PATCH 2/2] gic-v3 patch
+
+---
+ drivers/irqchip/irq-gic-v3.c | 186 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 180 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 6607ab58f..8615c526e 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -34,6 +34,7 @@
+ #include <asm/exception.h>
+ #include <asm/smp_plat.h>
+ #include <asm/virt.h>
++#include <asm/parasyte.h>
+ 
+ #include "irq-gic-common.h"
+ 
+@@ -83,6 +84,9 @@ static DEFINE_STATIC_KEY_FALSE(gic_arm64_2941627_erratum);
+ static struct gic_chip_data gic_data __read_mostly;
+ static DEFINE_STATIC_KEY_TRUE(supports_deactivate_key);
+ 
++static u64 *gic_parasyte_hive_affinities = NULL;
++static u32 gic_parasyte_nr_hive_affinities = 0;
++
+ #define GIC_ID_NR	(1U << GICD_TYPER_ID_BITS(gic_data.rdists.gicd_typer))
+ #define GIC_LINE_NR	min(GICD_TYPER_SPIS(gic_data.rdists.gicd_typer), 1020U)
+ #define GIC_ESPI_NR	GICD_TYPER_ESPIS(gic_data.rdists.gicd_typer)
+@@ -981,6 +985,75 @@ static void __init gic_dist_init(void)
+ 		gic_write_irouter(affinity, base + GICD_IROUTERnE + i * 8);
+ }
+ 
++void gic_dist_init_readonly(void)
++{
++	unsigned int i;
++	u64 affinity;
++	void __iomem *base = gic_data.dist_base;
++	u32 val;
++
++	val = readl_relaxed(base + GICD_CTLR);
++	pr_info("GICD_CTLR:\t 0x%lx\n", val);
++
++#ifndef GIC_DIST_CONFIG
++#define GIC_DIST_CONFIG			0xc00
++#endif
++#ifndef GIC_DIST_PRI
++#define GIC_DIST_PRI			0x400
++#endif
++#ifndef GIC_DIST_ACTIVE_CLEAR
++#define GIC_DIST_ACTIVE_CLEAR		0x380
++#endif
++#ifndef GIC_DIST_ENABLE_CLEAR
++#define GIC_DIST_ENABLE_CLEAR		0x180
++#endif
++
++#define GICD_PRINT_REG(reg, offset) do {\
++	val = readl_relaxed(base + reg + offset); \
++	pr_debug(#reg "%d:\t 0x%lx\n", offset / 4, val); \
++	} while (0)
++
++	for (i = 32; i < GIC_LINE_NR; i += 32)
++		GICD_PRINT_REG(GICD_IGROUPR, i / 8);
++
++	/* Extended SPI range, not handled by the GICv2/GICv3 common code */
++	for (i = 0; i < GIC_ESPI_NR; i += 32) {
++		GICD_PRINT_REG(GICD_ICENABLERnE, i / 8);
++		GICD_PRINT_REG(GICD_ICACTIVERnE, i / 8);
++	}
++
++	for (i = 0; i < GIC_ESPI_NR; i += 32)
++		GICD_PRINT_REG(GICD_IGROUPRnE, i / 8);
++
++	for (i = 0; i < GIC_ESPI_NR; i += 16)
++		GICD_PRINT_REG(GICD_ICFGRnE, i / 4);
++
++	for (i = 0; i < GIC_ESPI_NR; i += 4)
++		GICD_PRINT_REG(GICD_IPRIORITYRnE, i);
++
++	for (i = 32; i < GIC_LINE_NR; i += 16)
++		GICD_PRINT_REG(GIC_DIST_CONFIG, i / 4);
++
++	for (i = 32; i < GIC_LINE_NR; i += 4)
++		GICD_PRINT_REG(GIC_DIST_PRI, i);
++
++	for (i = 32; i < GIC_LINE_NR; i += 32) {
++		GICD_PRINT_REG(GIC_DIST_ACTIVE_CLEAR, i / 8);
++		GICD_PRINT_REG(GIC_DIST_ENABLE_CLEAR, i / 8);
++	}
++
++	for (i = 32; i < GIC_LINE_NR; i++) {
++		affinity = readq_relaxed(base + GICD_IROUTER + i * 8);
++		pr_debug("GICD_IROUTER%d:\t 0x%lx\n", i, affinity);
++	}
++
++	for (i = 0; i < GIC_ESPI_NR; i++) {
++		affinity = readq_relaxed(base + GICD_IROUTERnE + i * 8);
++		pr_debug("GICD_IROUTERnE%d:\t 0x%lx\n", i, affinity);
++	}
++}
++EXPORT_SYMBOL_GPL(gic_dist_init_readonly);
++
+ static int gic_iterate_rdists(int (*fn)(struct redist_region *, void __iomem *))
+ {
+ 	int ret = -ENODEV;
+@@ -1401,6 +1474,30 @@ static void gic_ipi_send_mask(struct irq_data *d, const struct cpumask *mask)
+ 	isb();
+ }
+ 
++static void gic_parasyte_notify_hive(unsigned int irq)
++{
++	u64 mpidr, cluster_id;
++	u16 tlist;
++	static int idx = 0;
++
++	if (WARN_ON(irq >= 16))
++		return;
++
++	if (WARN_ON(gic_parasyte_hive_affinities == NULL
++		 || gic_parasyte_nr_hive_affinities <= 0))
++		return;
++
++	wmb();
++
++	mpidr = gic_parasyte_hive_affinities[idx];
++	cluster_id = MPIDR_TO_SGI_CLUSTER_ID(mpidr);
++	tlist = 1 << (mpidr & 0xf);
++	gic_send_sgi(cluster_id, tlist, irq);
++	idx = (idx + 1) % gic_parasyte_nr_hive_affinities;
++
++	isb();
++}
++
+ static void __init gic_smp_init(void)
+ {
+ 	struct irq_fwspec sgi_fwspec = {
+@@ -1418,11 +1515,11 @@ static void __init gic_smp_init(void)
+ 				  gic_starting_cpu, NULL);
+ 
+ 	/* Register all 8 non-secure SGIs */
+-	base_sgi = irq_domain_alloc_irqs(gic_data.domain, 8, NUMA_NO_NODE, &sgi_fwspec);
++	base_sgi = irq_domain_alloc_irqs(gic_data.domain, 16, NUMA_NO_NODE, &sgi_fwspec);
+ 	if (WARN_ON(base_sgi <= 0))
+ 		return;
+ 
+-	set_smp_ipi_range(base_sgi, 8);
++	set_smp_ipi_range(base_sgi, 16);
+ }
+ 
+ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
+@@ -1467,10 +1564,36 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
+ 
+ 	return IRQ_SET_MASK_OK_DONE;
+ }
++
++static int gic_set_affinity_bug(struct irq_data *d, const struct cpumask *mask_val,
++				bool force)
++{
++	unsigned int cpu;
++
++	if (force)
++		cpu = cpumask_first(mask_val);
++	else
++		cpu = cpumask_any_and(mask_val, cpu_online_mask);
++
++	if (cpu >= nr_cpu_ids)
++		return -EINVAL;
++
++	if (gic_irq_in_rdist(d))
++		return -EINVAL;
++
++	WARN(true, "Trying to set route of interrupt %d to CPU%d, forbidden\n", d->hwirq, cpu);
++
++	return -EINVAL;
++}
+ #else
+ #define gic_set_affinity	NULL
++#define gic_set_affinity_bug	NULL
+ #define gic_ipi_send_mask	NULL
+ #define gic_smp_init()		do { } while(0)
++static void gic_parasyte_notify_hive(unsigned int irq)
++{
++	WARN(true, "gic_parasyte_notify_hive not implemented\n");
++}
+ #endif
+ 
+ static int gic_retrigger(struct irq_data *data)
+@@ -1971,7 +2094,8 @@ static int __init gic_init_bases(phys_addr_t dist_phys_base,
+ 				 struct redist_region *rdist_regs,
+ 				 u32 nr_redist_regions,
+ 				 u64 redist_stride,
+-				 struct fwnode_handle *handle)
++				 struct fwnode_handle *handle,
++				 bool parasyte)
+ {
+ 	u32 typer;
+ 	int err;
+@@ -2040,7 +2164,11 @@ static int __init gic_init_bases(phys_addr_t dist_phys_base,
+ 
+ 	gic_cpu_sys_reg_enable();
+ 	gic_prio_init();
+-	gic_dist_init();
++	if (parasyte) {
++		gic_dist_init_readonly();
++		parasyte_set_notify_hive(gic_parasyte_notify_hive);
++	} else
++		gic_dist_init();
+ 	gic_cpu_init();
+ 	gic_enable_nmi_support();
+ 	gic_smp_init();
+@@ -2055,6 +2183,11 @@ static int __init gic_init_bases(phys_addr_t dist_phys_base,
+ 			gicv2m_init(handle, gic_data.domain);
+ 	}
+ 
++	if (parasyte) {
++		gic_chip.irq_set_affinity = gic_set_affinity_bug;
++		gic_eoimode1_chip.irq_set_affinity = gic_set_affinity_bug;
++	}
++
+ 	return 0;
+ 
+ out_free:
+@@ -2191,6 +2324,44 @@ static void __iomem *gic_of_iomap(struct device_node *node, int idx,
+ 	return base ?: IOMEM_ERR_PTR(-ENOMEM);
+ }
+ 
++static void __init gic_of_setup_parasyte(struct device_node *node)
++{
++	u32 cells;
++	const __be32 *prop;
++	int psize, nr_affinities, i;
++	u64 *affinities;
++	if (of_property_read_u32(node, "#parasyte-affinity-cells", &cells)) {
++		pr_err("%pOF: #parasyte-hive-mpidr-cells not detected\n", node);
++		return;
++	}
++
++	prop = of_get_property(node, "parasyte-affinities", &psize);
++	if (!prop) {
++		pr_err("%pOF: parasyte-affinities not detected\n", node);
++		return;
++	}
++
++	psize /= 4;
++	if (psize % cells != 0) {
++		pr_err("%pOF: size of parasyte-affinities: %d does not match #parasyte-affinity-cells: %d\n",
++			node, psize, cells);
++		return;
++	}
++
++	nr_affinities = psize / cells;
++	affinities = kcalloc(nr_affinities, sizeof(*affinities), GFP_KERNEL);
++	if (!affinities) {
++		pr_err("%pOF: failed to alloc memory for parasyte-affinities\n", node);
++		return;
++	}
++
++	for (i = 0; i < nr_affinities; i++)
++		affinities[i] = of_read_number(prop + i * cells, cells);
++
++	gic_parasyte_hive_affinities = affinities;
++	gic_parasyte_nr_hive_affinities = nr_affinities;
++}
++
+ static int __init gic_of_init(struct device_node *node, struct device_node *parent)
+ {
+ 	phys_addr_t dist_phys_base;
+@@ -2200,6 +2371,7 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
+ 	u64 redist_stride;
+ 	u32 nr_redist_regions;
+ 	int err, i;
++	bool parasyte = of_property_read_bool(node, "parasyte");
+ 
+ 	dist_base = gic_of_iomap(node, 0, "GICD", &res);
+ 	if (IS_ERR(dist_base)) {
+@@ -2241,10 +2413,12 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
+ 	gic_enable_of_quirks(node, gic_quirks, &gic_data);
+ 
+ 	err = gic_init_bases(dist_phys_base, dist_base, rdist_regs,
+-			     nr_redist_regions, redist_stride, &node->fwnode);
++			     nr_redist_regions, redist_stride, &node->fwnode, parasyte);
+ 	if (err)
+ 		goto out_unmap_rdist;
+ 
++	if (parasyte) gic_of_setup_parasyte(node);
++
+ 	gic_populate_ppi_partitions(node);
+ 
+ 	if (static_branch_likely(&supports_deactivate_key))
+@@ -2577,7 +2751,7 @@ gic_acpi_init(union acpi_subtable_headers *header, const unsigned long end)
+ 
+ 	err = gic_init_bases(dist->base_address, acpi_data.dist_base,
+ 			     acpi_data.redist_regs, acpi_data.nr_redist_regions,
+-			     0, gsi_domain_handle);
++			     0, gsi_domain_handle, false);
+ 	if (err)
+ 		goto out_fwhandle_free;
+ 
+-- 
+2.51.2
+
